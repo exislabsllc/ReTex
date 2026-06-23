@@ -1,0 +1,50 @@
+%% ReTeX example — a software engineer resume.
+%% Render with:  npx tsx examples/build.ts   (outputs examples/out/*.html)
+
+\name{Jane Doe}
+\title{Senior Software Engineer}
+
+\icon{email} \email{jane@example.com}
+\icon{phone} \phone{+1 (555) 010-0192}
+\icon{location} \location{San Francisco, CA}
+\icon{github} \href{https://github.com/janedoe}{github.com/janedoe}
+\icon{linkedin} \href{https://linkedin.com/in/janedoe}{in/janedoe}
+
+\section{Summary}
+
+Senior engineer with 8+ years building \textbf{distributed systems} and
+developer tooling. I care about \textit{reliability}, clean APIs, and shipping
+things people actually use.
+
+\section{Experience}
+
+\job{title=Staff Software Engineer, company=OpenAI, location=Remote, start=2023, end=Present}{
+Led platform reliability for high-traffic inference services.
+\begin{itemize}
+  \item Cut p99 latency by \textbf{40\%} by redesigning the request scheduler.
+  \item Built an internal \textcolor{#2563eb}{observability} platform used by 200+ engineers.
+  \item Mentored 6 engineers; 2 were promoted within a year.
+\end{itemize}
+}
+
+\job{title=Senior Software Engineer, company=Stripe, location=New York, NY, start=2019, end=2023}{
+Owned the payments ledger pipeline processing billions of events per day.
+\begin{itemize}
+  \item Migrated a monolith to event-driven services with zero downtime.
+  \item Reduced infra spend by \$1.2M/year through autoscaling improvements.
+\end{itemize}
+}
+
+\section{Projects}
+
+\project{name=ReTeX, url=https://github.com/janedoe/retex, start=2024, end=Present}{
+A modern, LaTeX-inspired resume compiler with HTML, React, and PDF renderers.
+}
+
+\section{Skills}
+
+\skills{TypeScript, JavaScript, Go, Rust, React, Node.js, PostgreSQL, Kubernetes, AWS, GCP}
+
+\section{Education}
+
+\education{school=Massachusetts Institute of Technology, degree=B.S. Computer Science, location=Cambridge, MA, start=2011, end=2015}

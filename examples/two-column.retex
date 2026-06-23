@@ -1,0 +1,48 @@
+%% ReTeX example — a two-column developer portfolio using \begin{columns}.
+
+\name{Sam Builder}
+\title{Full-Stack Developer & Designer}
+
+\icon{github} \href{https://github.com/sambuilder}{sambuilder}
+\icon{website} \website{https://sambuilder.dev}
+\icon{email} \email{sam@builder.dev}
+
+\section{Profile}
+
+Product-minded engineer who ships polished web apps end to end — from
+\themecolor{primary}{design systems} to deploy pipelines.
+
+\begin{columns}
+
+\column{62%}
+
+\section{Experience}
+
+\job{title=Founding Engineer, company=Tiny Startup, start=2022, end=Present}{
+First engineering hire; built the product from zero to 30k users.
+\begin{itemize}
+  \item Designed and shipped the entire web client in React.
+  \item Set up CI/CD, observability, and on-call from scratch.
+\end{itemize}
+}
+
+\job{title=Frontend Engineer, company=Agency Co, start=2019, end=2022}{
+Delivered 20+ client sites with a shared component library.
+}
+
+\column{38%}
+
+\section{Skills}
+\skills{TypeScript, React, Next.js, Node, Figma, Tailwind, Postgres}
+
+\section{Education}
+\education{school=State University, degree=B.A. Design, start=2015, end=2019}
+
+\section{Links}
+{\small
+\icon{github} \href{https://github.com/sambuilder}{GitHub} \\
+\icon{linkedin} \href{https://linkedin.com/in/sambuilder}{LinkedIn} \\
+\icon{twitter} \href{https://twitter.com/sambuilder}{Twitter}
+}
+
+\end{columns}

@@ -1,0 +1,349 @@
+import type { SourceRange } from "./source.js";
+
+/**
+ * The ReTeX Abstract Syntax Tree.
+ *
+ * Every node is a member of the {@link Node} discriminated union keyed on
+ * `type`. Nodes fall into three broad families:
+ *
+ *  - **Structural** — {@link DocumentNode}, {@link GroupNode}, {@link ParBreakNode}.
+ *  - **Inline / typography** — text, marks (bold/italic/…), links, icons.
+ *  - **Resume semantics** — sections, jobs, education, skills, contact fields.
+ *
+ * Unknown or plugin-provided commands are preserved as {@link CommandNode} so
+ * the tree is always a faithful, loss-less representation of the source and can
+ * be re-rendered by custom renderers.
+ */
+
+export interface NodeBase {
+  type: string;
+  /** Source span this node was produced from. Synthetic nodes may omit it. */
+  range?: SourceRange;
+  /**
+   * Stable structural hash used by the incremental compiler / render cache.
+   * Populated lazily; never authored by hand.
+   */
+  hash?: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Structural nodes                                                    */
+/* ------------------------------------------------------------------ */
+
+export interface DocumentNode extends NodeBase {
+  type: "document";
+  children: Node[];
+}
+
+/** A literal run of text. */
+export interface TextNode extends NodeBase {
+  type: "text";
+  value: string;
+}
+
+/** A paragraph break (one or more blank lines). */
+export interface ParBreakNode extends NodeBase {
+  type: "parbreak";
+}
+
+/** An explicit line break (`\\` or `\newline`). */
+export interface LineBreakNode extends NodeBase {
+  type: "linebreak";
+}
+
+/** A horizontal rule (`\hrule` / `\divider`). */
+export interface RuleNode extends NodeBase {
+  type: "rule";
+}
+
+/** Spacing primitive (`\vspace{1em}` / `\hspace{...}`). */
+export interface SpaceNode extends NodeBase {
+  type: "space";
+  axis: "horizontal" | "vertical";
+  size: string;
+}
+
+/** A bare `{ ... }` group. Mostly used to scope font switches. */
+export interface GroupNode extends NodeBase {
+  type: "group";
+  children: Node[];
+}
+
+/* ------------------------------------------------------------------ */
+/* Typography / inline marks                                           */
+/* ------------------------------------------------------------------ */
+
+export type MarkType = "bold" | "italic" | "underline" | "strike";
+
+/** Simple wrapping mark such as `\textbf{...}`. */
+export interface MarkNode extends NodeBase {
+  type: MarkType;
+  children: Node[];
+}
+
+/** `\textcolor{#hex|name}{...}` */
+export interface ColorNode extends NodeBase {
+  type: "color";
+  color: string;
+  children: Node[];
+}
+
+/** `\themecolor{primary}{...}` — color resolved from the active theme. */
+export interface ThemeColorNode extends NodeBase {
+  type: "themecolor";
+  token: string;
+  children: Node[];
+}
+
+/** `\fontsize{14pt}{...}` */
+export interface FontSizeNode extends NodeBase {
+  type: "fontsize";
+  size: string;
+  children: Node[];
+}
+
+/** `\fontfamily{Inter}{...}` */
+export interface FontFamilyNode extends NodeBase {
+  type: "fontfamily";
+  family: string;
+  children: Node[];
+}
+
+/** Relative size switch: `\small`, `\large`, `\Large`, `\Huge`. */
+export type FontScale = "small" | "normal" | "large" | "Large" | "Huge";
+export interface FontScaleNode extends NodeBase {
+  type: "fontscale";
+  scale: FontScale;
+  /** Content the switch applies to (rest of the enclosing group). */
+  children: Node[];
+}
+
+/* ------------------------------------------------------------------ */
+/* Hyperlinks & icons                                                  */
+/* ------------------------------------------------------------------ */
+
+/** `\href{url}{label}` */
+export interface LinkNode extends NodeBase {
+  type: "link";
+  /** Sanitized, render-safe URL. */
+  href: string;
+  /** Original, unsanitized URL (kept for diagnostics / round-tripping). */
+  rawHref: string;
+  children: Node[];
+}
+
+/** `\url{url}` — renders the URL as its own label. */
+export interface UrlNode extends NodeBase {
+  type: "url";
+  href: string;
+  rawHref: string;
+}
+
+/** `\icon{github}` */
+export interface IconNode extends NodeBase {
+  type: "icon";
+  name: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Sections & lists                                                    */
+/* ------------------------------------------------------------------ */
+
+export interface SectionNode extends NodeBase {
+  type: "section";
+  title: string;
+  /** 1 = `\section`, 2 = `\subsection`. */
+  level: number;
+}
+
+export type ListKind = "itemize" | "enumerate";
+
+export interface ListNode extends NodeBase {
+  type: "list";
+  kind: ListKind;
+  items: ListItemNode[];
+}
+
+export interface ListItemNode extends NodeBase {
+  type: "item";
+  children: Node[];
+}
+
+/* ------------------------------------------------------------------ */
+/* Layout                                                              */
+/* ------------------------------------------------------------------ */
+
+export interface ColumnsNode extends NodeBase {
+  type: "columns";
+  columns: ColumnNode[];
+  /** Gap between columns, e.g. `"1.5rem"`. */
+  gap?: string;
+}
+
+export interface ColumnNode extends NodeBase {
+  type: "column";
+  /** Width as authored (`"40%"`, `"200px"`, `"2fr"`). */
+  width: string;
+  children: Node[];
+}
+
+/* ------------------------------------------------------------------ */
+/* Resume / CV semantics                                               */
+/* ------------------------------------------------------------------ */
+
+export type ContactField = "name" | "title" | "email" | "phone" | "location" | "website";
+
+/** One of the single-value header commands (`\name`, `\email`, …). */
+export interface ContactNode extends NodeBase {
+  type: "contact";
+  field: ContactField;
+  value: string;
+}
+
+/** Parsed `key=value` map preserving per-field source ranges. */
+export interface FieldMap {
+  [key: string]: string;
+}
+
+/** `\job{title=…, company=…, …}{ body }` */
+export interface JobNode extends NodeBase {
+  type: "job";
+  fields: FieldMap;
+  children: Node[];
+}
+
+/** `\education{school=…, degree=…, …}{ body? }` */
+export interface EducationNode extends NodeBase {
+  type: "education";
+  fields: FieldMap;
+  children: Node[];
+}
+
+/** `\project{name=…, …}{ body? }` */
+export interface ProjectNode extends NodeBase {
+  type: "project";
+  fields: FieldMap;
+  children: Node[];
+}
+
+/** `\skills{a, b, c}` */
+export interface SkillsNode extends NodeBase {
+  type: "skills";
+  items: string[];
+}
+
+/* ------------------------------------------------------------------ */
+/* Generic / extensibility / recovery                                  */
+/* ------------------------------------------------------------------ */
+
+/** A parsed argument attached to a generic {@link CommandNode}. */
+export interface ArgumentNode {
+  kind: "required" | "optional";
+  /** Parsed children for `content` arguments. */
+  children: Node[];
+  /** Raw text for `string`/verbatim arguments. */
+  raw?: string;
+  range?: SourceRange;
+}
+
+/**
+ * A command the core does not model natively — including every
+ * plugin-registered command and any unknown command encountered during
+ * lenient parsing. Keeps the tree loss-less.
+ */
+export interface CommandNode extends NodeBase {
+  type: "command";
+  name: string;
+  args: ArgumentNode[];
+}
+
+/** A placeholder emitted during error recovery so rendering can continue. */
+export interface ErrorNode extends NodeBase {
+  type: "error";
+  message: string;
+  /** The raw source that could not be parsed. */
+  raw: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Union & helpers                                                     */
+/* ------------------------------------------------------------------ */
+
+export type Node =
+  | DocumentNode
+  | TextNode
+  | ParBreakNode
+  | LineBreakNode
+  | RuleNode
+  | SpaceNode
+  | GroupNode
+  | MarkNode
+  | ColorNode
+  | ThemeColorNode
+  | FontSizeNode
+  | FontFamilyNode
+  | FontScaleNode
+  | LinkNode
+  | UrlNode
+  | IconNode
+  | SectionNode
+  | ListNode
+  | ListItemNode
+  | ColumnsNode
+  | ColumnNode
+  | ContactNode
+  | JobNode
+  | EducationNode
+  | ProjectNode
+  | SkillsNode
+  | CommandNode
+  | ErrorNode;
+
+export type NodeType = Node["type"];
+
+/** Map from node `type` to its concrete interface, for typed visitors. */
+export interface NodeMap {
+  document: DocumentNode;
+  text: TextNode;
+  parbreak: ParBreakNode;
+  linebreak: LineBreakNode;
+  rule: RuleNode;
+  space: SpaceNode;
+  group: GroupNode;
+  bold: MarkNode;
+  italic: MarkNode;
+  underline: MarkNode;
+  strike: MarkNode;
+  color: ColorNode;
+  themecolor: ThemeColorNode;
+  fontsize: FontSizeNode;
+  fontfamily: FontFamilyNode;
+  fontscale: FontScaleNode;
+  link: LinkNode;
+  url: UrlNode;
+  icon: IconNode;
+  section: SectionNode;
+  list: ListNode;
+  item: ListItemNode;
+  columns: ColumnsNode;
+  column: ColumnNode;
+  contact: ContactNode;
+  job: JobNode;
+  education: EducationNode;
+  project: ProjectNode;
+  skills: SkillsNode;
+  command: CommandNode;
+  error: ErrorNode;
+}
+
+/** Nodes that carry a `children: Node[]` array. */
+export type ParentNode = Extract<Node, { children: Node[] }>;
+
+export function isParent(node: Node): node is ParentNode {
+  return Array.isArray((node as { children?: unknown }).children);
+}
+
+/** Type guard generator for a given node type. */
+export function isNode<T extends NodeType>(node: Node, type: T): node is NodeMap[T] {
+  return node.type === type;
+}

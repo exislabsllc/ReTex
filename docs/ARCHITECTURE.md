@@ -1,0 +1,442 @@
+# ReTeX Architecture
+
+This document explains how ReTeX works end to end: the compiler pipeline, the
+AST, the registry that drives both parsing and plugins, the theming model, the
+rendering layer, the incremental compiler, the security model, and the extension
+points. It is aimed at contributors and at anyone integrating ReTeX deeply.
+
+---
+
+## Overview
+
+ReTeX is a small but complete compiler. Source text flows through four pure
+stages, each of which threads precise `SourceRange` provenance so diagnostics and
+editor features map back to the exact bytes the author typed.
+
+```
+  ReTeX source (string)
+        │
+        ▼
+  ┌───────────────┐
+  │  Tokenizer    │  src/tokenizer        →  Token[]  + Diagnostic[]
+  └───────────────┘
+        │
+        ▼
+  ┌───────────────┐
+  │   Parser      │  src/parser           →  DocumentNode + Diagnostic[]
+  │  (recursive   │  (consults the CommandRegistry for
+  │   descent)    │   arg signatures + AST builders)
+  └───────────────┘
+        │
+        ▼
+  ┌───────────────┐
+  │  Validator    │  src/validator        →  Diagnostic[]
+  └───────────────┘
+        │
+        ▼
+  ┌───────────────┐
+  │  Renderers    │  src/renderers        →  HTML / React / JSON / PDF
+  └───────────────┘
+```
+
+The `ReTeXEngine` (`src/engine.ts`) wires these together, adds an LRU compile
+cache, owns the active theme and the per-instance command registry, and applies
+plugins. Each subsystem is also exported standalone for fine-grained use.
+
+---
+
+## Stage 1 — Tokenizer
+
+**Location:** `src/tokenizer/tokenizer.ts`. **Entry point:** `tokenize(source)`
+→ `{ tokens, diagnostics }`.
+
+The tokenizer is a hand-written, single-pass lexer. It is *deliberately
+permissive* — it never throws — so all error handling happens downstream in the
+parser, which can recover gracefully.
+
+Key design choices (all résumé-driven):
+
+- **`%` is literal.** A lone `%` is text, so `40%` and `\column{40%}` work
+  verbatim. Comments are `%%`-to-end-of-line.
+- **Escapes** (`\%`, `\&`, `\{`, `\}`, `\_`, `\$`, `\#`, `\ `) become literal
+  text tokens.
+- **`\\`** is an explicit line break.
+- **Whitespace folding.** A run of whitespace containing two or more newlines
+  becomes a single `ParBreak`; otherwise it is `Whitespace`.
+- **Newline normalization.** `\r\n`/`\r` are normalized to `\n` up front so
+  position math is platform-independent.
+
+Token kinds (`src/types/tokens.ts`): `Command`, `LBrace`, `RBrace`, `LBracket`,
+`RBracket`, `Text`, `Whitespace`, `ParBreak`, `LineBreak`, `Comment`, `EOF`.
+Every token carries its exact `SourceRange` (offset/line/column).
+
+---
+
+## Stage 2 — Parser
+
+**Location:** `src/parser/parser.ts`. **Entry point:** `parse(tokens, options)`
+→ `{ ast, diagnostics }`.
+
+A recursive-descent parser that turns the token stream into a `DocumentNode`. It
+has four notable responsibilities:
+
+### Registry-driven parsing
+
+The parser does not hard-code command behavior. For each `Command` token it looks
+up a `CommandDefinition` in the **`CommandRegistry`** to learn:
+
+- the **argument signature** (`ArgSpec[]`) — how many arguments and of which kind
+  (`content`, `string`, `keyval`, `list`), with optional `bracket` delimiters;
+- whether the command is a **scoped switch**;
+- the **`build`** function that constructs the AST node from the parsed
+  arguments.
+
+This is the same registry that plugins extend, which is why a plugin command is a
+first-class citizen of parsing (see [The command registry](#the-command-registry)).
+
+### Argument consumption
+
+`ArgSpec.kind` controls how an argument is read:
+
+- `content` — recursively parsed as markup (nested commands + text), yielding
+  `ArgumentNode.children`.
+- `string` — read **verbatim** (no command expansion), yielding
+  `ArgumentNode.raw`. Used for URLs, colors, sizes, and key=value/list bodies.
+- `keyval` / `list` — read verbatim like `string`; the builder then parses the
+  raw text with `parseKeyValArg` / `parseListArg`.
+
+### Error recovery
+
+The parser never throws and always returns a tree:
+
+- **Unknown commands** are kept as a generic `CommandNode` (greedily absorbing
+  any `{…}` arguments) and reported with a "did you mean?" suggestion computed by
+  Levenshtein distance (`src/parser/suggest.ts`), including an editor quick-fix.
+- **Unknown environments** degrade to a `GroupNode` wrapping their parsed body.
+- **Unterminated groups/arguments**, **mismatched braces**, and **mismatched /
+  missing `\end`** are each reported with a specific `DiagnosticCode`, while
+  parsing continues.
+
+### Scoped switches and environments
+
+- **Scoped switches** (`\large`, `\bfseries`, …) consume the *remainder of the
+  current content scope* as their children, then the loop breaks — mirroring
+  LaTeX declaration semantics. Wrapping a switch in `{ … }` bounds it.
+- **Environments** (`\begin{x} … \end{x}`) are dispatched via
+  `EnvironmentDefinition`. When the definition declares an `itemCommand`
+  (e.g. `item` for `itemize`, `column` for `columns`), the body is sliced into
+  `EnvEntry[]` at each marker before the builder runs; otherwise the whole body
+  is passed through. Optional `[…]` arguments after `\begin{x}` are collected as
+  `options`.
+
+---
+
+## Stage 3 — Validator
+
+**Location:** `src/validator/validator.ts`. **Entry point:** `validate(ast, { theme? })`
+→ `Diagnostic[]`.
+
+A pure, side-effect-free semantic pass over the AST (via the `walk` traversal).
+It complements the parser's *syntactic* diagnostics with *semantic* ones:
+
+- empty `\section` headings and empty contact fields;
+- stray `\item` / `\column` that survived as raw command nodes (i.e. used outside
+  their environment) — these are errors;
+- `\themecolor{token}` referencing a token not present in the supplied theme;
+- empty `\skills`.
+
+Validation is optional: `engine.compile(source, { validate: false })` (and
+`engine.parse`) skip it.
+
+---
+
+## Stage 4 — Renderers
+
+**Location:** `src/renderers/`. Four targets share the same logical structuring
+so they produce identical layouts.
+
+| Target | Module          | Entry points                                           | Output        |
+| ------ | --------------- | ------------------------------------------------------ | ------------- |
+| HTML   | `html.ts`       | `renderHtml`, `renderHtmlDocument`, `HtmlRenderer`     | `string`      |
+| React  | `react.ts`      | `renderReact`, `ReactRenderer`                         | element tree  |
+| JSON   | `json.ts`       | `renderJson`, `toJsonTree`                             | `string`      |
+| PDF    | `pdf.ts`        | `renderPrintHtml`, `renderPdf`, `pageCss`              | `string` / `Uint8Array` |
+
+### Shared structuring helpers
+
+`src/renderers/structure.ts` and `src/renderers/context.ts` contain the layout
+logic both the HTML and React renderers reuse, so the two never drift:
+
+- **`toRegions(children)`** — split a document into regions delimited by
+  level-1 `\section`s (a leading region holds the preamble).
+- **`splitPreamble(nodes)`** — separate the header pieces (`name`, `title`, and
+  "contactish" nodes: `contact`, `icon`, `link`, `url`) from the rest.
+- **`entryParts(fields, kind)`** / **`dateRange(...)`** — normalize a job/
+  education/project field map into a renderable `{ title, subtitle, dates,
+  location, url }`.
+- **`isBlockNode(node)`** / **`BLOCK_TYPES`** — decide whether a node breaks the
+  inline flow. The renderers' `renderFlow` groups consecutive inline nodes into
+  `<p>` paragraphs and emits block nodes between them.
+
+### HTML renderer
+
+Produces clean, semantic, fully-escaped HTML. Class names are prefixed
+(default `retex`) and the matching stylesheet comes from `themeToCss`
+(`src/renderers/css.ts`), which emits theme values as CSS custom properties.
+`renderDocument` wraps the fragment in a complete `<!DOCTYPE html>` page with an
+inline `<style>`. Every text node and attribute is escaped, and every URL is
+re-sanitized at render time as defense in depth.
+
+### React renderer
+
+Mirrors the HTML renderer's structure and class names — so the same theme
+stylesheet applies — but emits an element tree. It is **dependency-free**: the
+caller supplies the JSX factory (`createElement`) and `Fragment`, so it works
+with React, Preact, or any compatible runtime. Icons are injected via the
+runtime's `dangerouslySetInnerHTML` escape hatch.
+
+### JSON renderer
+
+A deep clone of the AST, optionally stripping `range`/`hash` metadata
+(`stripMeta`) for compact, stable, diff-friendly payloads.
+
+### PDF / print
+
+`renderPrintHtml` produces a standalone, paginated HTML document (theme styles +
+`@page` geometry from `pageCss`). That HTML is the portable core of the PDF
+strategy and can be printed in the browser (`window.print()`), handed to any
+HTML-to-PDF service, or converted headlessly by `renderPdf`, which lazily imports
+`puppeteer` (an *optional* dependency) or accepts an injected `launch` adapter
+for Playwright/pooled/remote Chromium.
+
+---
+
+## The AST
+
+**Location:** `src/types/ast.ts`. The AST is a discriminated union (`Node`) keyed
+on `type`. Unknown and plugin-provided commands are preserved as generic
+`CommandNode`s, so the tree is always a loss-less, re-renderable representation
+of the source.
+
+| Family            | Node types                                                                 |
+| ----------------- | ------------------------------------------------------------------------- |
+| **Structural**    | `document`, `text`, `parbreak`, `linebreak`, `rule`, `space`, `group`     |
+| **Typography**    | `bold`, `italic`, `underline`, `strike` (`MarkNode`), `color`, `themecolor`, `fontsize`, `fontfamily`, `fontscale` |
+| **Links & icons** | `link`, `url`, `icon`                                                      |
+| **Sections/lists**| `section`, `list`, `item`                                                  |
+| **Layout**        | `columns`, `column`                                                        |
+| **Résumé**        | `contact`, `job`, `education`, `project`, `skills`                         |
+| **Generic**       | `command` (with `ArgumentNode[]`), `error`                                |
+
+Every node extends `NodeBase` with an optional `range` (source span) and an
+optional lazily-populated `hash` (used by the incremental/render caches). Helper
+predicates `isParent`, `isNode<T>` and the `NodeMap` type enable typed visitors.
+
+### AST utilities
+
+- `walk(root, { enter, exit })` — depth-first traversal; `childrenOf(node)`
+  resolves children wherever they live (`children`, `items`, or `columns`).
+- `collect(root, pred)` — gather all nodes matching a predicate.
+- `nodePathAt(root, offset)` — innermost node containing an offset, plus
+  ancestors (for editor features).
+- `flattenText(node | nodes)` / `normalizeWhitespace(s)` — best-effort plain-text
+  extraction (titles, labels, key=value parsing).
+
+---
+
+## The command registry
+
+**Location:** `src/parser/registry.ts` (the `CommandRegistry` class) and
+`src/parser/builtins.ts` (`createDefaultRegistry`, the source of truth for all
+built-ins).
+
+The registry is the architectural keystone: a single map of command and
+environment definitions that **drives both parsing and extensibility**.
+
+- The **parser** reads it for argument signatures, scope behavior, and node
+  builders.
+- The **plugin system** mutates it to add commands/environments.
+- It is **per-engine**: `createDefaultRegistry()` builds a fresh registry for
+  each `ReTeXEngine`, and `clone()` copies the maps — so plugins extend a private
+  copy and never touch global state.
+
+A `CommandDefinition` (`src/types/commands.ts`) carries: `name`, `category`
+(`inline` / `block` / `switch` / `meta`), `args` (`ArgSpec[]`), `scoped`,
+`build` (a `NodeBuilder`), and documentation fields (`summary`, `documentation`,
+`example`) used by editor tooling. An `EnvironmentDefinition` adds `itemCommand`,
+`allowedChildren`, and an environment `build`.
+
+Builders receive a `BuildContext` with the parsed `args`, the switch `scope`, a
+`report` callback for diagnostics, and `utils` (`textOf`, `safeUrl`). Returning
+`null` drops the command; returning a node or array of nodes inserts them.
+
+---
+
+## Theming model
+
+**Location:** `src/types/theme.ts`, `src/theme/`.
+
+Themes are **plain data** (no functions), so they serialize, ship over the wire,
+and compose at runtime. A `Theme` has `name`, `colors`, `fonts`, `fontSizes`,
+`spacing`, `page`, and a `sectionStyle` hint (`underline` | `rule` | `plain` |
+`bar`). The `colors` map is open-ended — arbitrary named swatches are addressable
+via `\themecolor{name}`.
+
+- `defaultTheme` is the canonical base; all presets are partial overrides of it.
+- `resolveTheme(partial, base?)` deep-merges a `PartialTheme` over a base.
+- Presets: `modernTheme`, `classicTheme`, `compactTheme`; plus the `themes` map
+  and `getTheme(name)` lookup.
+- `themeToCss(theme, prefix)` emits the stylesheet, exposing every theme value as
+  a `--<prefix>-…` CSS custom property (and every color as
+  `--<prefix>-color-<token>`).
+
+The engine accepts either a full `Theme` or a `PartialTheme` in its options or
+via `setTheme`; partials are resolved against the current theme.
+
+---
+
+## Incremental compilation
+
+**Location:** `src/incremental/incremental.ts`.
+
+`IncrementalCompiler` is a block-level fast path optimized for live editing. It
+splits the document into **balanced segments** at blank-line boundaries —
+merging neighbors until braces and `\begin`/`\end` are balanced
+(`splitBalancedSegments`, `isBalanced`) — and caches each segment's parse keyed
+by its **exact text**.
+
+On each `compile`, unchanged blocks are served from the cache and re-positioned
+with a cheap range shift (`shiftClone`), so only edited blocks are re-tokenized
+and re-parsed. The produced AST is equivalent to a full parse (top-level blocks
+separated by `parbreak`), making it a drop-in for preview. `compile` returns
+`stats: { segments, cacheHits, cacheMisses }`; `reset()` clears the cache (e.g.
+after registering new commands).
+
+The engine itself also keeps an **LRU compile cache** (`cacheSize`, default 64),
+keyed by source + validation mode + a generation counter that is bumped whenever
+the registry or theme changes, invalidating stale entries.
+
+---
+
+## Security model
+
+**Location:** `src/security/sanitize.ts`. ReTeX renders untrusted markup, so
+safety is layered:
+
+- **HTML escaping** — `escapeHtml` / `escapeAttribute` escape every text node and
+  attribute value (ampersand first, then `<`, `>`, `"`, `'`).
+- **URL sanitization** — `sanitizeUrl` strips ASCII control characters (a classic
+  `java\tscript:` bypass), then allow-lists `http`, `https`, `mailto`, `tel`,
+  `ftp`, `sms`. Everything else (`javascript:`, `data:`, `vbscript:`, `file:`, …)
+  is blocked and replaced with `#`. URLs are vetted at parse time **and** again at
+  render time.
+- **CSS value vetting** — `isSafeColor` and `isSafeDimension` validate colors and
+  lengths before they reach a `style` attribute; `sanitizeStyleValue` rejects
+  values containing `<>;{}`, `expression(...)`, `url(...)`, or `javascript:`.
+- **No code execution** — there is no `eval`, no `Function`, and no
+  template-string interpolation of user input into executable contexts.
+
+---
+
+## Folder structure
+
+```
+src/
+├── index.ts              # public export surface (re-exports everything below)
+├── engine.ts             # ReTeXEngine: wires the pipeline + cache + theme + plugins
+│
+├── tokenizer/
+│   ├── tokenizer.ts      # the lexer (Tokenizer, tokenize)
+│   └── index.ts
+├── parser/
+│   ├── parser.ts         # recursive-descent parser with error recovery
+│   ├── registry.ts       # CommandRegistry
+│   ├── builtins.ts       # every built-in command + environment (createDefaultRegistry)
+│   ├── args.ts           # parseKeyValArg, parseListArg, splitTopLevel
+│   ├── suggest.ts        # levenshtein, closestMatch ("did you mean?")
+│   └── index.ts
+├── validator/
+│   ├── validator.ts      # semantic validation pass
+│   └── index.ts
+│
+├── ast/
+│   ├── walk.ts           # walk, collect, childrenOf, nodePathAt
+│   └── text.ts           # flattenText, normalizeWhitespace
+│
+├── renderers/
+│   ├── html.ts           # HtmlRenderer, renderHtml, renderHtmlDocument
+│   ├── react.ts          # ReactRenderer, renderReact (dependency-free)
+│   ├── json.ts           # renderJson, toJsonTree
+│   ├── pdf.ts            # renderPrintHtml, renderPdf, pageCss
+│   ├── css.ts            # themeToCss
+│   ├── structure.ts      # toRegions, splitPreamble, entryParts, dateRange
+│   ├── context.ts        # render contexts, isBlockNode, BLOCK_TYPES
+│   └── index.ts
+│
+├── theme/
+│   ├── default.ts        # defaultTheme
+│   ├── themes.ts         # resolveTheme, presets, themes map, getTheme
+│   └── index.ts
+├── plugin/
+│   ├── types.ts          # ReTeXPlugin, EngineCommand, PluginHost
+│   ├── examples.ts       # badgePlugin, ratingPlugin
+│   └── index.ts
+├── icons/
+│   ├── icons.ts          # icon registry + iconToSvg, registerIcon, iconNames…
+│   └── index.ts
+├── editor/
+│   ├── editor.ts         # EditorService (completion/hover/tokens/diagnostics/…)
+│   ├── printer.ts        # printDocument (the formatter)
+│   └── index.ts
+├── incremental/
+│   ├── incremental.ts    # IncrementalCompiler, splitBalancedSegments, isBalanced
+│   └── index.ts
+├── security/
+│   ├── sanitize.ts       # escapeHtml, sanitizeUrl, isSafeColor, isSafeDimension…
+│   └── index.ts
+└── types/
+    ├── source.ts         # Position, SourceRange + helpers
+    ├── tokens.ts         # TokenType, Token
+    ├── ast.ts            # the Node union + NodeMap + guards
+    ├── diagnostics.ts    # DiagnosticSeverity, DiagnosticCode, Diagnostic
+    ├── theme.ts          # Theme, PartialTheme
+    ├── commands.ts       # CommandDefinition, EnvironmentDefinition, ArgSpec…
+    └── index.ts
+```
+
+---
+
+## Extension points
+
+ReTeX is designed to be extended without forking. There are four:
+
+### 1. Plugins
+
+A `ReTeXPlugin` (`src/plugin/types.ts`) bundles any combination of commands,
+environments, icons, render overrides (`htmlRenderers` / `reactRenderers` keyed
+by node `type` or `command:<name>`), a theme patch, and an imperative `setup`
+hook. Install with `new ReTeXEngine({ plugins: [...] })` or `engine.use(plugin)`.
+`badgePlugin` and `ratingPlugin` are worked examples. A command may carry an
+inline `render` map (`EngineCommand`) instead of a custom AST node — the common
+case for simple inline commands.
+
+### 2. Custom renderers / render overrides
+
+Register an override with `engine.registerHtmlRenderer(key, fn)` /
+`engine.registerReactRenderer(key, fn)`, where `key` is a node `type` or
+`command:<name>`. The function receives the node, the render context (theme,
+class prefix, `cls()` helper, recursive child renderer), and a `renderChildren`
+callback. You can also drive the renderer classes (`HtmlRenderer`,
+`ReactRenderer`) directly with your own `overrides` map.
+
+### 3. Custom themes
+
+Supply a full `Theme` or a `PartialTheme` (deep-merged) via engine options,
+`setTheme`, or a plugin's `theme` field. Compose presets with `resolveTheme`.
+
+### 4. Custom icons
+
+`engine.registerIcon(name, def)` (or the module-level `registerIcon`, or a
+plugin's `icons` map) adds/overrides an icon. An `IconDefinition` is the inner
+markup of a `0 0 24 24` SVG using `currentColor`, with optional `stroked` and
+`aliases`.
